@@ -65,6 +65,23 @@ MAX_FUTURE_SKEW_SECONDS = int(os.getenv("MAX_FUTURE_SKEW_SECONDS", "60"))
 
 
 def lambda_handler(event, context):
+    if event.get("path") == "/emails":
+        from email_ingest import handle_email
+        table_name = os.getenv("EMAIL_QUARANTINE_TABLE")
+        if not table_name:
+            return _response(503, {
+                "error": "Email quarantine not configured"
+            })
+
+        quarantine_table = boto3.resource(
+            "dynamodb"
+        ).Table(table_name)
+
+        return handle_email(
+            event, kinesis_client,
+            CLICKSTREAM_NAME, quarantine_table
+        )
+
     try:
         body = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:

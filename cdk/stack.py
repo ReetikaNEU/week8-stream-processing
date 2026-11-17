@@ -144,9 +144,55 @@ class StreamProcessingStack(cdk.Stack):
             retention_period=cdk.Duration.days(14),
         )
 
+
+        quarantine_table = dynamodb.Table(
+            self, "EmailQuarantineTable",
+            table_name="week8-email-quarantine",
+            partition_key=dynamodb.Attribute(
+                name="quarantine_id",
+                type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+
+
+        # -- DynamoDB: email mailbox storage ----------------------------
+
+        mailbox_table = dynamodb.Table(
+            self, "EmailMailboxTable",
+            table_name="week8-email-mailboxes",
+            partition_key=dynamodb.Attribute(
+                name="recipient",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            sort_key=dynamodb.Attribute(
+                name="message_id",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+
+        # Supports date-ordered inbox and date-range queries.
+        mailbox_table.add_global_secondary_index(
+            index_name="RecipientByDate",
+            partition_key=dynamodb.Attribute(
+                name="recipient",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            sort_key=dynamodb.Attribute(
+                name="event_time_id",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+
         # -- Shared environment ----------------------------------------------
         common_env = {
             "CLICKSTREAM_NAME":     clickstream.stream_name,
+            "EMAIL_QUARANTINE_TABLE": quarantine_table.table_name,
+            "EMAIL_MAILBOX_TABLE": mailbox_table.table_name,
             "WINDOW_TABLE":         window_table.table_name,
             "LATE_TABLE":           late_table.table_name,
             "WATERMARK_TABLE":      watermark_table.table_name,
@@ -170,6 +216,7 @@ class StreamProcessingStack(cdk.Stack):
             log_retention=logs.RetentionDays.ONE_WEEK,
         )
         clickstream.grant_write(producer_fn)
+        quarantine_table.grant_write_data(producer_fn)
 
         # -- Lambda: WindowAggregator -----------------------------------------
         # Triggered by Kinesis. Batch window of 10s OR 100 records, whichever
@@ -206,6 +253,7 @@ class StreamProcessingStack(cdk.Stack):
         )
         window_table.grant_read_write_data(aggregator_fn)
         watermark_table.grant_read_write_data(aggregator_fn)
+        mailbox_table.grant_read_write_data(aggregator_fn)
         late_queue.grant_send_messages(aggregator_fn)
 
         # -- Lambda: LateDataHandler ------------------------------------------
@@ -229,6 +277,7 @@ class StreamProcessingStack(cdk.Stack):
             )
         )
         late_table.grant_read_write_data(late_handler_fn)
+        mailbox_table.grant_write_data(late_handler_fn)
 
         # -- API Gateway ----------------------------------------------------
         api = apigw.RestApi(
@@ -244,6 +293,12 @@ class StreamProcessingStack(cdk.Stack):
         )
         events_resource = api.root.add_resource("events")
         events_resource.add_method(
+            "POST",
+            apigw.LambdaIntegration(producer_fn, proxy=True),
+        )
+
+        emails_resource = api.root.add_resource("emails")
+        emails_resource.add_method(
             "POST",
             apigw.LambdaIntegration(producer_fn, proxy=True),
         )

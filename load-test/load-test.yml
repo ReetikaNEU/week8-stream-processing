@@ -1,0 +1,49 @@
+# INFO7375 Week 8 - Artillery Load Test
+# -------------------------------------
+# This load test is used in Scenario C (throughput vs. iterator age).
+# It deliberately sends MORE than the WindowAggregator can comfortably
+# process, to demonstrate iterator age growth.
+#
+# Before running:
+#   Replace https://dpdgyxh87a.execute-api.us-east-1.amazonaws.com/prod/ with the ApiEndpoint output from cdk deploy
+#
+# Run:
+#   artillery run load-test/load-test.yml
+
+config:
+  target: "https://dpdgyxh87a.execute-api.us-east-1.amazonaws.com/prod/"
+  phases:
+    - name: "Baseline"
+      duration: 60
+      arrivalRate: 10
+
+    # Sustained high throughput - watch IteratorAge in CloudWatch
+    - name: "Sustained high throughput"
+      duration: 180
+      arrivalRate: 100
+
+    - name: "Cool down"
+      duration: 60
+      arrivalRate: 10
+
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+  ensure:
+    p99: 1000
+    maxErrorRate: 1
+
+scenarios:
+  - name: "Send clickstream event"
+    weight: 100
+    flow:
+      - post:
+          url: "/events"
+          json:
+            user_id: "load-user-{{ $randomNumber(1, 200) }}"
+            event_type: "page_view"
+            page: "/products"
+            # event_time omitted - defaults to now (on-time)
+          expect:
+            - statusCode: 202

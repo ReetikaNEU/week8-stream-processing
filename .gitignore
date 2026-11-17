@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+cdk.out/
+node_modules/
+*.log
+.env
+scenario-d-backup/
+load-test/*-results.json
+load-test/load-test-smoke.yml

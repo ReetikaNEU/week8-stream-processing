@@ -1,0 +1,54 @@
+# INFO7375 Week 8 - Artillery Containment Load Test
+# --------------------------------------------------
+# Lower arrival rate for observing iterator age growth cleanly
+# without overwhelming the Lambda consumer entirely.
+#
+# Use this for Scenario C to see graceful iterator age growth
+# rather than complete consumer collapse.
+#
+# Before running:
+#   Replace API_ENDPOINT_HERE with the ApiEndpoint output from cdk deploy
+#
+# Run:
+#   artillery run load-test/load-test-containment.yml
+
+config:
+  target: "API_ENDPOINT_HERE"
+  phases:
+    - name: "Baseline"
+      duration: 60
+      arrivalRate: 5
+
+    - name: "Moderate throughput"
+      duration: 180
+      arrivalRate: 20
+
+    - name: "Cool down"
+      duration: 60
+      arrivalRate: 5
+
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "Send on-time event"
+    weight: 80
+    flow:
+      - post:
+          url: "/events"
+          json:
+            user_id: "user_{{ $randomInt(1, 500) }}"
+            page: "/product/{{ $randomInt(1, 100) }}"
+            action: "view"
+
+  - name: "Send late event"
+    weight: 20
+    flow:
+      - post:
+          url: "/events"
+          json:
+            user_id: "user_{{ $randomInt(1, 500) }}"
+            page: "/product/{{ $randomInt(1, 100) }}"
+            action: "view"
+            event_time_offset_seconds: -120

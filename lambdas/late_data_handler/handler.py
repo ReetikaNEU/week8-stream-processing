@@ -53,6 +53,11 @@ logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 dynamodb = boto3.resource("dynamodb")
 LATE_TABLE = os.environ["LATE_TABLE"]
+EMAIL_MAILBOX_TABLE = os.getenv("EMAIL_MAILBOX_TABLE")
+mailbox_table = (
+    dynamodb.Table(EMAIL_MAILBOX_TABLE)
+    if EMAIL_MAILBOX_TABLE else None
+)
 late_table = dynamodb.Table(LATE_TABLE)
 
 
@@ -73,6 +78,8 @@ def lambda_handler(event, context):
 
 def _process_late_record(record: dict):
     late = json.loads(record["body"])
+    if late.get("record_type") == "email":
+        return _process_late_email(late)
     event        = late["event"]
     window_start = late["window_start"]
     lateness_s   = late["lateness_seconds"]
@@ -112,6 +119,81 @@ def _process_late_record(record: dict):
                 extra={"window_start": window_start,
                        "event_id": event["event_id"],
                        "lateness_seconds": lateness_s})
+
+
+def _process_late_email(late):
+    """Store a late email exactly once in its LATE folder."""
+    if mailbox_table is None:
+        raise RuntimeError("EMAIL_MAILBOX_TABLE is not configured")
+
+    email = late["event"]
+
+    event_time = datetime.fromisoformat(
+        email["event_time"].replace("Z", "+00:00")
+    )
+    ingested_at = datetime.fromisoformat(
+        email["ingested_at"].replace("Z", "+00:00")
+    )
+
+    if event_time.tzinfo is None or ingested_at.tzinfo is None:
+        raise ValueError("Email timestamps must have timezones")
+
+    event_time = event_time.astimezone(timezone.utc)
+    ingested_at = ingested_at.astimezone(timezone.utc)
+    processed_at = datetime.now(timezone.utc)
+
+    recipient = email["recipient"].strip().lower()
+    message_id = str(email["message_id"])
+
+    item = {
+        "recipient": recipient,
+        "message_id": message_id,
+        "sender": email["sender"],
+        "subject": email["subject"],
+        "body": email.get("body", ""),
+        "date": email.get("date", email["event_time"]),
+        "event_time": event_time.isoformat(),
+        "event_time_id": (
+            event_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            + "#" + message_id
+        ),
+        "ingested_at": ingested_at.isoformat(),
+        "delivered_at": processed_at.isoformat(),
+        "delivery_latency_ms": max(
+            0,
+            int((processed_at - ingested_at).total_seconds() * 1000),
+        ),
+        "folder": "LATE",
+        "window_start": late["window_start"],
+        "lateness_seconds": Decimal(
+            str(late.get("lateness_seconds", 0))
+        ),
+    }
+
+    try:
+        mailbox_table.put_item(
+            Item=item,
+            ConditionExpression=(
+                "attribute_not_exists(recipient) "
+                "AND attribute_not_exists(message_id)"
+            ),
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == (
+            "ConditionalCheckFailedException"
+        ):
+            logger.info(
+                "late_email_duplicate message_id=%s",
+                message_id,
+            )
+            return False
+        raise
+
+    logger.info(
+        "late_email_recorded message_id=%s",
+        message_id,
+    )
+    return True
 
 
 def _record_max_lateness(window_start: str, metric_name: str, lateness_s):

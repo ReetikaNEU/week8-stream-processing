@@ -279,6 +279,23 @@ class StreamProcessingStack(cdk.Stack):
         late_table.grant_read_write_data(late_handler_fn)
         mailbox_table.grant_write_data(late_handler_fn)
 
+        # -- Lambda: EmailReader -----------------------------------------
+
+        reader_fn = lambda_.Function(
+            self, "EmailReader",
+            function_name="week8-email-reader",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.lambda_handler",
+            code=lambda_.Code.from_asset("../lambdas/email_reader"),
+            timeout=cdk.Duration.seconds(20),
+            memory_size=128,
+            logging_format=lambda_.LoggingFormat.JSON,
+            environment=common_env,
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+
+        mailbox_table.grant_read_data(reader_fn)
+
         # -- API Gateway ----------------------------------------------------
         api = apigw.RestApi(
             self, "EventsApi",
@@ -301,6 +318,32 @@ class StreamProcessingStack(cdk.Stack):
         emails_resource.add_method(
             "POST",
             apigw.LambdaIntegration(producer_fn, proxy=True),
+        )
+
+        # -- Email mailbox read API -------------------------------------
+
+        mailboxes_resource = api.root.add_resource("mailboxes")
+
+        recipient_resource = mailboxes_resource.add_resource(
+            "{recipient}"
+        )
+
+        messages_resource = recipient_resource.add_resource(
+            "messages"
+        )
+
+        messages_resource.add_method(
+            "GET",
+            apigw.LambdaIntegration(reader_fn, proxy=True),
+        )
+
+        message_resource = messages_resource.add_resource(
+            "{message_id}"
+        )
+
+        message_resource.add_method(
+            "GET",
+            apigw.LambdaIntegration(reader_fn, proxy=True),
         )
 
         health_resource = api.root.add_resource("health")

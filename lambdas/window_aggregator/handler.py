@@ -87,6 +87,7 @@ from datetime import datetime, timezone, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
+from email_delivery import process_email_batch
 
 logger = logging.getLogger()
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -100,11 +101,20 @@ LATE_QUEUE_URL        = os.environ["LATE_QUEUE_URL"]
 WINDOW_SIZE_SECONDS   = int(os.environ["WINDOW_SIZE_SECONDS"])
 GRACE_PERIOD_SECONDS  = int(os.environ["GRACE_PERIOD_SECONDS"])
 MAX_FUTURE_SKEW_SECONDS = int(os.getenv("MAX_FUTURE_SKEW_SECONDS", "60"))
+EMAIL_MAILBOX_TABLE = os.getenv("EMAIL_MAILBOX_TABLE")
 
 REQUIRED_FIELDS = ("event_id", "user_id", "event_type", "event_time")
+EMAIL_REQUIRED_FIELDS = (
+    "message_id", "sender", "recipient",
+    "subject", "date", "event_time", "ingested_at",
+)
 
 window_table    = dynamodb.Table(WINDOW_TABLE)
 watermark_table = dynamodb.Table(WATERMARK_TABLE)
+mailbox_table = (
+    dynamodb.Table(EMAIL_MAILBOX_TABLE)
+    if EMAIL_MAILBOX_TABLE else None
+)
 
 
 class BadRecord(Exception):
@@ -122,12 +132,17 @@ def lambda_handler(event, context):
     """
     # Group records by shard - watermark is tracked per shard
     records_by_shard: dict[str, list[dict]] = defaultdict(list)
+    email_records_by_shard: dict[str, list[dict]] = defaultdict(list)
     bad_by_shard: dict[str, int] = defaultdict(int)
 
     for record in event["Records"]:
         shard_id = _extract_shard_id(record["eventID"])
         try:
-            records_by_shard[shard_id].append(_decode_record(record))
+            decoded = _decode_record(record)
+            if decoded.get("record_type") == "email":
+                email_records_by_shard[shard_id].append(decoded)
+            else:
+                records_by_shard[shard_id].append(decoded)
         except BadRecord as exc:
             bad_by_shard[shard_id] += 1
             logger.warning(
@@ -136,6 +151,9 @@ def lambda_handler(event, context):
                 extra={"shard_id": shard_id,
                        "sequence_number": record["kinesis"].get("sequenceNumber"),
                        "reason": str(exc)})
+
+    if email_records_by_shard and mailbox_table is None:
+        raise RuntimeError("EMAIL_MAILBOX_TABLE is not configured")
 
     for shard_id in set(records_by_shard) | set(bad_by_shard):
         valid = records_by_shard.get(shard_id, [])
@@ -146,6 +164,26 @@ def lambda_handler(event, context):
             # Nothing usable in this batch: do not touch the watermark.
             logger.info("batch_processed shard=%s records=0 bad_records=%d", shard_id, bad,
                         extra={"shard_id": shard_id, "records": 0, "bad_records": bad})
+
+    for shard_id, emails in email_records_by_shard.items():
+        counts = process_email_batch(
+            shard_id,
+            emails,
+            watermark_table,
+            mailbox_table,
+            sqs_client,
+            LATE_QUEUE_URL,
+            window_seconds=WINDOW_SIZE_SECONDS,
+            grace_seconds=GRACE_PERIOD_SECONDS,
+        )
+
+        logger.info(
+            "email_batch_processed shard=%s delivered=%d duplicate=%d late_queued=%d",
+            shard_id,
+            counts["delivered"],
+            counts["duplicate"],
+            counts["late_queued"],
+        )
 
     # Only INFRASTRUCTURE errors are raised (they retry the whole batch). Bad data
     # was skipped above. The value below is ignored unless the event source mapping
@@ -163,11 +201,18 @@ def _decode_record(record: dict) -> dict:
 
     if not isinstance(payload, dict):
         raise BadRecord("payload is not a JSON object")
-    for field in REQUIRED_FIELDS:
+    required_fields = (
+        EMAIL_REQUIRED_FIELDS
+        if payload.get("record_type") == "email"
+        else REQUIRED_FIELDS
+    )
+    for field in required_fields:
         if field not in payload:
             raise BadRecord(f"missing field {field}")
 
     event_time = _parse_event_time(payload["event_time"])
+    if payload.get("record_type") == "email":
+        _parse_event_time(payload["ingested_at"])
 
     # Defense in depth against a bad clock: an event cannot honestly claim to have
     # happened after the moment Kinesis received it.
